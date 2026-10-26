@@ -38,6 +38,9 @@ import org.apache.logging.log4j.Logger;
 import java.io.*;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.TreeSet;
 
 /**
  * Read and parse a CSV file.
@@ -64,6 +67,10 @@ public class DelimitedFileReader implements AutoCloseable {
     private File fyle;
     private String originalRow;
     private HashMap<String,Integer> nameMap;
+    private HashMap<String,Integer> normMap;                 // normalized title -> column (see normalizeHeaders)
+    private final ArrayList<String> headerTitles = new ArrayList<>();
+    private boolean normalizeHeaders = false;
+    private final ArrayList<String[]> aliases = new ArrayList<>();  // [0] = logical name, rest = alternate titles
 
     /**
      * Open an existing CSV file with the specified delimiter and quote character.
@@ -148,7 +155,7 @@ public class DelimitedFileReader implements AutoCloseable {
     public double getDouble(String fld) {
         if (nameMap == null)
             return 0.0;
-        Integer i = nameMap.get(fld.toLowerCase());
+        Integer i = resolve(fld);
         if (i == null)
             return 0.0;
         try {
@@ -192,12 +199,17 @@ public class DelimitedFileReader implements AutoCloseable {
         originalRow = null;
         lineValues.clear();
         nameMap = new HashMap<String, Integer>();
+        normMap = new HashMap<String, Integer>();
+        headerTitles.clear();
         try {
             nextLine();
             for (int i = 0; i < lineValues.size(); i++) {
                 String name = getString(i);
-                if (name != null && !name.isEmpty())
+                headerTitles.add(name);
+                if (name != null && !name.isEmpty()) {
                     nameMap.put(name.toLowerCase(), i);
+                    normMap.put(normalize(name), i);
+                }
             }
         } catch (Exception ignored) {
 
@@ -212,7 +224,7 @@ public class DelimitedFileReader implements AutoCloseable {
      * @return          true if the header exists, false otherwise
      */
     public boolean hasHeader(String header) {
-        return nameMap.containsKey(header.toLowerCase());
+        return resolve(header) != null;
     }
 
     /**
@@ -225,13 +237,182 @@ public class DelimitedFileReader implements AutoCloseable {
     public ArrayList<String> checkHeaders(String [] colNames) {
         ArrayList<String> res = null;
         for (String colName : colNames) {
-            if (!nameMap.containsKey(colName.toLowerCase())) {
+            if (resolve(colName) == null) {
                 if (res == null)
                     res = new ArrayList<>();
                 res.add(colName);
             }
         }
         return res;
+    }
+
+    /**
+     * Turn header-name normalization on or off (default off).
+     * <br><br>
+     * When on, column titles are matched ignoring case, white space, hyphens, underscores, and
+     * non-printable characters (such as a leading byte-order mark).  For example, the file title
+     * <code>"Company-Name"</code>, <code>"company_name"</code>, and <code>"\uFEFFCompany Name"</code> all match
+     * the name <code>"Company Name"</code>.  This applies to <code>getString(name)</code>, <code>getInt(name)</code>,
+     * <code>getDouble(name)</code>, <code>getDate(name)</code>, <code>hasHeader</code>, <code>checkHeaders</code>,
+     * and the alias facility.  It may be called before or after <code>readHeader()</code>.
+     * <br><br>
+     * When off (the default) behavior is unchanged: titles are matched case-insensitively only.
+     *
+     * @param on true to enable normalized matching
+     * @see #addAlias(String, String...)
+     */
+    public void setNormalizeHeaders(boolean on) {
+        normalizeHeaders = on;
+    }
+
+    /**
+     * Register alternate column titles for a logical column name.
+     * <br><br>
+     * After this call, looking up <code>logical</code> by name (<code>getString("Company Name")</code>, etc.) finds
+     * the file column titled <code>logical</code> itself or, failing that, the first of the <code>alternates</code>
+     * that is present in the file.  Matching follows {@link #setNormalizeHeaders(boolean)}.
+     * This may be called before or after <code>readHeader()</code>.
+     * <pre>
+     *   rdr.setNormalizeHeaders(true);
+     *   rdr.addAlias("Company Name", "Company", "Account Name");
+     *   rdr.readHeader();
+     *   rdr.requireHeaders("Company Name", "Phone");
+     *   while (rdr.nextLine())
+     *       String company = rdr.getString("Company Name");
+     * </pre>
+     *
+     * @param logical the logical column name callers will use
+     * @param alternates other titles that may be used for that column in a file
+     */
+    public void addAlias(String logical, String... alternates) {
+        String[] a = new String[alternates.length + 1];
+        a[0] = logical;
+        System.arraycopy(alternates, 0, a, 1, alternates.length);
+        aliases.add(a);
+    }
+
+    /**
+     * Return the zero-origin column index for the given name, honoring normalization and aliases.
+     * Note that this only works after <code>readHeader()</code> has been called.
+     *
+     * @param name the logical column name or title
+     * @return the column index or -1 if there is no such column
+     */
+    public int getColumnIndex(String name) {
+        Integer i = resolve(name);
+        return i == null ? -1 : i;
+    }
+
+    /**
+     * Return the logical names, from among those given, that have no matching column in the file.
+     * Note that this only works after <code>readHeader()</code> has been called.
+     *
+     * @param logicalNames the required column names (aliases and normalization apply)
+     * @return the missing names, in the order given; empty if none are missing
+     */
+    public List<String> missingHeaders(String... logicalNames) {
+        List<String> res = new ArrayList<>();
+        for (String n : logicalNames)
+            if (resolve(n) == null)
+                res.add(n);
+        return res;
+    }
+
+    /**
+     * Verify that all of the required columns are present.
+     * Note that this only works after <code>readHeader()</code> has been called.
+     *
+     * @param logicalNames the required column names (aliases and normalization apply)
+     * @throws IllegalArgumentException listing <em>all</em> of the missing columns
+     * @see #missingHeaders(String...)
+     */
+    public void requireHeaders(String... logicalNames) {
+        List<String> missing = missingHeaders(logicalNames);
+        if (!missing.isEmpty())
+            throw new IllegalArgumentException("Missing required column(s): " + String.join(", ", missing));
+    }
+
+    /**
+     * Report file columns that resolve to the same logical column.  Two columns collide if their titles
+     * are equal (case-insensitively, or normalized if enabled) or if both are acceptable titles
+     * for the same logical column registered with {@link #addAlias(String, String...)}.
+     * Note that this only works after <code>readHeader()</code> has been called.
+     *
+     * @return one entry per collision, each listing the colliding file titles; empty if none
+     */
+    public List<String> getDuplicateHeaders() {
+        LinkedHashSet<TreeSet<Integer>> groups = new LinkedHashSet<>();
+        HashMap<String, TreeSet<Integer>> byKey = new HashMap<>();
+        for (int i = 0; i < headerTitles.size(); i++) {
+            String t = headerTitles.get(i);
+            if (t != null && !t.isEmpty())
+                byKey.computeIfAbsent(key(t), k -> new TreeSet<>()).add(i);
+        }
+        for (TreeSet<Integer> g : byKey.values())
+            if (g.size() > 1)
+                groups.add(g);
+        for (String[] a : aliases) {
+            TreeSet<Integer> g = new TreeSet<>();
+            for (String n : a) {
+                TreeSet<Integer> m = byKey.get(key(n));
+                if (m != null)
+                    g.addAll(m);
+            }
+            if (g.size() > 1)
+                groups.add(g);
+        }
+        List<String> res = new ArrayList<>();
+        for (TreeSet<Integer> g : groups) {
+            StringBuilder sb = new StringBuilder();
+            for (int i : g) {
+                if (sb.length() > 0)
+                    sb.append(", ");
+                sb.append(headerTitles.get(i));
+            }
+            res.add(sb.toString());
+        }
+        return res;
+    }
+
+    /**
+     * Normalize a column title: lower case with white space, hyphens, underscores, and non-printable
+     * characters (control and format characters such as a BOM) removed.
+     */
+    private static String normalize(String s) {
+        StringBuilder sb = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (Character.isWhitespace(c) || Character.isSpaceChar(c) || c == '-' || c == '_' || Character.isISOControl(c) || Character.getType(c) == Character.FORMAT)
+                continue;
+            sb.append(Character.toLowerCase(c));
+        }
+        return sb.toString();
+    }
+
+    private String key(String s) {
+        return normalizeHeaders ? normalize(s) : s.trim().toLowerCase();
+    }
+
+    private Integer titleIndex(String title) {
+        return normalizeHeaders ? normMap.get(normalize(title)) : nameMap.get(title.toLowerCase());
+    }
+
+    /**
+     * Find the column for a name: first as a title, then via any alias registered for it.
+     */
+    private Integer resolve(String name) {
+        if (nameMap == null || name == null)
+            return null;
+        Integer i = titleIndex(name);
+        if (i != null || aliases.isEmpty())
+            return i;
+        final String k = key(name);
+        for (String[] a : aliases)
+            if (key(a[0]).equals(k))
+                for (int j = 1; j < a.length; j++)
+                    if ((i = titleIndex(a[j])) != null)
+                        return i;
+        return null;
     }
 
     /**
@@ -395,7 +576,7 @@ public class DelimitedFileReader implements AutoCloseable {
     public String getString(String fld) {
         if (nameMap == null)
             return "";
-        final Integer item = nameMap.get(fld.toLowerCase());
+        final Integer item = resolve(fld);
         if (item == null || item >= lineValues.size())
             return "";
         String s = lineValues.get(item);
@@ -457,7 +638,7 @@ public class DelimitedFileReader implements AutoCloseable {
     public int getInt(String fld) {
         if (nameMap == null)
             return 0;
-        Integer item = nameMap.get(fld.toLowerCase());
+        Integer item = resolve(fld);
         if (item == null)
             return 0;
         try {

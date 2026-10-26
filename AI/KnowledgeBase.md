@@ -689,6 +689,41 @@ expected value. `PasswordHash` uses it internally for hash verification.
 shared `SecureRandom` instance, so new code needing random key material or tokens has one obvious place
 to get it rather than instantiating another `SecureRandom`.
 
+### Reading CSV Columns by Header Name (`org.kissweb.DelimitedFileReader`)
+
+After `readHeader()`, fields are read by title (`getString/getInt/getDouble/getDate(name)`). By default titles
+match case-insensitively only. Opt-in facilities for robust matching of user-supplied files:
+
+- `setNormalizeHeaders(true)` - also ignore white space, hyphens, underscores, and non-printable characters
+  (e.g. a UTF-8 BOM on the first title). Applies to every by-name getter, `hasHeader`, `checkHeaders`, aliases.
+- `addAlias("Company Name", "Company", "Account Name")` - a logical name with alternate acceptable titles; the
+  logical name itself is tried first. Works through all by-name getters. Order relative to `readHeader()` is free.
+- `missingHeaders(names...)` returns every missing logical name; `requireHeaders(names...)` throws
+  `IllegalArgumentException` listing all of them. `getColumnIndex(name)` returns the index or -1.
+- `getDuplicateHeaders()` returns one entry per set of file columns that resolve to the same logical column
+  (equal titles, or titles of the same alias group). When duplicates exist the last column wins a lookup, so
+  check this when ambiguity matters.
+
+Typical use: set normalization and aliases, `readHeader()`, `requireHeaders(...)`, then loop `nextLine()`.
+
+### CSV Import Framework (`org.kissweb.DelimitedFileImport`)
+
+Persistence-agnostic base class for importing a CSV file; built on `DelimitedFileReader` (normalized headers + aliases).
+It never touches a database, logger, or web path - the subclass and hooks do.
+
+- Subclass implements `initColumns()` (calls `addColumn(name, required, aliases...)`), `checkRow(rowNum)`, `parseRow(rowNum)`.
+  Helpers: `getString(name)`, `columnHasData(name)`, `colExists(name)`, `getFileColumns()`, `fixNum(s)`; reader is `df`.
+- `run()` (never throws) validates the header (missing required, duplicate, nothing recognized), runs the check pass
+  over all rows, and only if there are zero errors runs the parse pass; in `FULL_MODE` it then calls `deactivateMissing()`.
+  Errors are prefixed with the 1-based data row number. `addWarning` does not stop the import.
+- Modes: `APPEND_MODE`, `UPDATE_MODE`, `FULL_MODE` (field `mode`). Counters `recordsAdded/Updated/Deactivated` are
+  incremented by the subclass; `rowsRead` by the base.
+- No-op hooks: `commitBatch()` (every `setBatchSize(n)` rows, default 20, and at the end of the parse pass),
+  `onFinish(Result)`, `onFailure(Throwable)`, `log(level, msg)`. `setLogPath(path)` makes Kiss write
+  `Result.getSummary()` to that file with plain java.io; the caller computes any URL.
+- `Result`: `getErrors()`, `getWarnings()`, `isSuccess()`, counts, `getSummary()`.
+- Transactions: the subclass owns them (commit in `commitBatch()`/`onFinish`, roll back in `onFailure`).
+
 ### OAuth 2.1 (`org.kissweb.oauth`)
 
 Kiss implements all three OAuth 2.1 roles. Each is inert unless configured (no runtime cost, no files created). Full reference: `OAuth.md`.
