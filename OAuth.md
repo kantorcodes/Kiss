@@ -131,7 +131,7 @@ If `OAuthAuthorizationServer` is **not** set, the OAuth subsystem is inert: the 
 
 When OAuth is configured, **every `MCPServerBase` subclass automatically requires a valid bearer token on every request.** No code change to the MCP servlet is needed — the default `authenticate()` method in `MCPServerBase` consults `OAuthConfig` and, if enabled, calls `BearerTokenValidator.requireBearerToken()`.
 
-This is by design. MCP is OAuth 2.1's primary use case, and the MCP spec mandates bearer-token authentication; making developers write the same one-line override in every MCP servlet would be friction without benefit.
+This is Kiss's default when OAuth is configured, not a requirement imposed on every MCP server. The [MCP authorization specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization#protocol-requirements) makes authorization optional and defines an OAuth-based flow for HTTP transports; it says stdio implementations should instead obtain credentials from the environment. Central enforcement means individual `MCPServerBase` subclasses do not need to opt in separately.
 
 **Behavior at a glance:**
 
